@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 import os
 import asyncio
 import traceback
+import argparse
 from datetime import datetime, timezone
 
 load_dotenv()
@@ -20,15 +21,24 @@ if os.getenv("LOGFIRE_API_KEY"):
     logfire.configure(token=os.getenv("LOGFIRE_API_KEY"))
     logfire.instrument_openai()
 
-# Set up OpenRouter based model
+# Set up argument parser
+parser = argparse.ArgumentParser(description='Serper Scraper Batch Agent')
+parser.add_argument('--model', type=str, default='anthropic/claude-3.7-sonnet',
+                    help='Model string to use (default: anthropic/claude-3.7-sonnet)')
+args = parser.parse_args()
+
+# Set up OpenRouter based model with the model string from arguments
 API_KEY = os.getenv('OPENROUTER_API_KEY')
 model = OpenAIModel(
-    'anthropic/claude-3.5-sonnet',
+    args.model,
     provider=OpenAIProvider(
         base_url='https://openrouter.ai/api/v1', 
         api_key=API_KEY
     ),
 )
+
+# Print the model being used
+print(f"Using model: {args.model}")
 
 # MCP Environment variables
 env = {
