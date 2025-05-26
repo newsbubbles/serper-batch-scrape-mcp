@@ -1,12 +1,22 @@
 # Serper Scraper Batch MCP Server
 
-This project enhances the serper-scraper MCP server with a batch scraping capability, allowing for simultaneous scraping of multiple URLs.
+This project enhances the serper-scraper MCP server with a batch scraping capability and optimized content extraction, allowing for simultaneous scraping of multiple URLs while focusing on user-visible content and important links.
 
 ## Features
 
 - **Google Search**: Perform Google searches via the Serper API
-- **Single URL Scraping**: Scrape content from a single URL
-- **Batch URL Scraping**: Scrape content from multiple URLs in parallel
+- **Optimized Single URL Scraping**: Scrape content from a single URL with focus on visible content and links
+- **Optimized Batch URL Scraping**: Scrape content from multiple URLs in parallel with content optimization
+
+## Content Optimization
+
+The scraper focuses on extracting only what's relevant to users:
+
+- **User-Visible Content Only**: Filters out scripts, hidden elements, and invisible content
+- **Link Extraction**: Identifies and extracts important links with their text
+- **Content Structure Preservation**: Organizes content by headings, paragraphs, and lists
+- **Duplicate Removal**: Eliminates redundant content
+- **Metadata Extraction**: Gets meta description and other important meta tags
 
 ## Project Structure
 
@@ -48,7 +58,7 @@ python mcp_server.py
 #### Batch Scraping Multiple URLs
 
 ```
-> I want to scrape these three URLs at the same time: https://example.com, https://google.com, and https://github.com
+> I want to scrape these three URLs at the same time and only show me the important content and links: https://example.com, https://google.com, and https://github.com
 ```
 
 #### Performing a Google Search
@@ -60,7 +70,7 @@ python mcp_server.py
 #### Scraping a Single URL
 
 ```
-> Scrape this website and give me a summary: https://news.ycombinator.com
+> Scrape this website and give me the main content and important links: https://news.ycombinator.com
 ```
 
 ## API Details
@@ -75,9 +85,21 @@ python mcp_server.py
 - `url` (str): The URL that was scraped
 - `timestamp` (str): When the scraping was performed
 - `title` (Optional[str]): Title of the webpage, if available
-- `html` (str): Raw HTML content
-- `markdown` (Optional[str]): Markdown representation of the content (if requested)
-- `text` (Optional[str]): Plain text content
+- `main_content` (List[ScrapedContent]): The main visible content structured by type
+- `links` (List[Link]): Important links extracted from the page
+- `meta_description` (Optional[str]): Meta description of the page if available
 - `meta_tags` (List[MetaTag]): Metadata tags extracted from the page
 - `json_ld` (List[JSONLD]): JSON-LD structured data from the page
 - `error` (Optional[str]): Error message if scraping failed
+
+### ScrapedContent Model
+
+- `type` (str): Type of content (heading, paragraph, list, etc.)
+- `text` (str): The actual text content
+- `level` (Optional[int]): For headings, the level (1-6)
+
+### Link Model
+
+- `text` (str): The visible text of the link
+- `url` (str): The URL the link points to
+- `is_external` (bool): Whether the link points to an external domain

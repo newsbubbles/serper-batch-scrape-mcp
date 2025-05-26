@@ -4,9 +4,10 @@ from typing import Dict, List, Optional, Union, Any, Literal
 from pydantic import BaseModel, Field
 from datetime import datetime
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment
 import re
 import concurrent.futures
+from urllib.parse import urljoin, urlparse
 
 
 class GoogleSearchRequest(BaseModel):
@@ -30,6 +31,13 @@ class BatchScrapeRequest(BaseModel):
     includeMarkdown: Optional[bool] = Field(None, description="Whether to include markdown content.")
 
 
+class Link(BaseModel):
+    """Represents a link extracted from a webpage."""
+    text: str = Field(..., description="The visible text of the link")
+    url: str = Field(..., description="The URL the link points to")
+    is_external: bool = Field(..., description="Whether the link points to an external domain")
+
+
 class MetaTag(BaseModel):
     name: Optional[str] = None
     property: Optional[str] = None
@@ -41,15 +49,22 @@ class JSONLD(BaseModel):
     parsed: Any
 
 
+class ScrapedContent(BaseModel):
+    """A section of content from the scraped page."""
+    type: str = Field(..., description="Type of content (heading, paragraph, list, etc)")
+    text: str = Field(..., description="The actual text content")
+    level: Optional[int] = Field(None, description="For headings, the level (1-6)")
+
+
 class ScrapeResult(BaseModel):
     url: str
     timestamp: str
     title: Optional[str] = None
-    html: str
-    markdown: Optional[str] = None
-    text: Optional[str] = None
-    meta_tags: List[MetaTag]
-    json_ld: List[JSONLD]
+    main_content: List[ScrapedContent] = Field([], description="The main visible content of the page in structured format")
+    links: List[Link] = Field([], description="Important links extracted from the page")
+    meta_description: Optional[str] = Field(None, description="Meta description of the page if available")
+    meta_tags: List[MetaTag] = []
+    json_ld: List[JSONLD] = []
     error: Optional[str] = None
 
 
@@ -107,96 +122,211 @@ class SerperScraperClient:
                 # Skip invalid JSON
                 pass
         return json_ld_list
-
-    async def _html_to_markdown(self, html: str) -> str:
-        """Convert HTML to markdown format."""
-        # This is a simple implementation, consider using a dedicated library like html2markdown
-        # for a more comprehensive conversion
-        soup = BeautifulSoup(html, 'html.parser')
-
-        # Remove script and style tags
-        for script in soup(["script", "style"]):
-            script.extract()
-
-        text = soup.get_text(separator='\n', strip=True)
-
-        # Basic markdown formatting
-        # Headers
-        for i in range(6, 0, -1):
-            for header in soup.find_all(f'h{i}'):
-                head_text = header.get_text(strip=True)
-                text = text.replace(head_text, f"{'#' * i} {head_text}\n")
-
-        # Bold text
-        for bold in soup.find_all(['strong', 'b']):
-            bold_text = bold.get_text(strip=True)
-            if bold_text:
-                text = text.replace(bold_text, f"**{bold_text}**")
-
-        # Italic text
-        for italic in soup.find_all(['em', 'i']):
-            italic_text = italic.get_text(strip=True)
-            if italic_text:
-                text = text.replace(italic_text, f"*{italic_text}*")
-
-        # Lists
-        for ul in soup.find_all('ul'):
-            for li in ul.find_all('li'):
-                li_text = li.get_text(strip=True)
-                if li_text:
-                    text = text.replace(li_text, f"* {li_text}")
-
-        # Ordered lists
-        counter = 1
-        for ol in soup.find_all('ol'):
-            for li in ol.find_all('li'):
-                li_text = li.get_text(strip=True)
-                if li_text:
-                    text = text.replace(li_text, f"{counter}. {li_text}")
-                    counter += 1
-
-        # Links
-        for a in soup.find_all('a', href=True):
-            link_text = a.get_text(strip=True)
-            if link_text:
-                text = text.replace(link_text, f"[{link_text}]({a['href']})")
-
-        return text
+    
+    def _is_visible_element(self, element) -> bool:
+        """Determine if an element would be visible to users."""
+        if element.name in ['script', 'style', 'meta', 'noscript', 'head']:
+            return False
+            
+        # Check for hidden elements
+        style = element.get('style', '')
+        if 'display:none' in style or 'visibility:hidden' in style:
+            return False
+            
+        # Check for comment nodes
+        if isinstance(element, Comment):
+            return False
+            
+        # Skip empty elements
+        if not element.get_text(strip=True):
+            return False
+            
+        return True
+        
+    def _remove_duplicate_content(self, content_list: List[ScrapedContent]) -> List[ScrapedContent]:
+        """Remove duplicate or near-duplicate content items."""
+        unique_content = []
+        seen_texts = set()
+        
+        for content in content_list:
+            # Normalize text for comparison
+            normalized_text = re.sub(r'\s+', ' ', content.text).strip().lower()
+            
+            # Skip if too short (likely not useful)
+            if len(normalized_text) < 5:
+                continue
+                
+            # Skip if duplicate or near-duplicate
+            if normalized_text in seen_texts:
+                continue
+                
+            # Check for near-duplicates (text contained within other texts)
+            is_duplicate = False
+            for seen_text in seen_texts:
+                # If this text is just a small part of an existing text, skip it
+                if len(normalized_text) < 50 and normalized_text in seen_text:
+                    is_duplicate = True
+                    break
+            
+            if not is_duplicate:
+                seen_texts.add(normalized_text)
+                unique_content.append(content)
+                
+        return unique_content
+        
+    def _extract_links(self, soup: BeautifulSoup, base_url: str) -> List[Link]:
+        """Extract important links from the page."""
+        links = []
+        base_domain = urlparse(base_url).netloc
+        
+        for a_tag in soup.find_all('a', href=True):
+            href = a_tag.get('href', '').strip()
+            if not href or href.startswith('#') or href.startswith('javascript:'):
+                continue
+                
+            # Get the link text and clean it
+            link_text = a_tag.get_text(strip=True)
+            if not link_text:
+                continue
+                
+            # Normalize the URL
+            full_url = urljoin(base_url, href)
+            
+            # Check if external link
+            link_domain = urlparse(full_url).netloc
+            is_external = link_domain != base_domain
+            
+            links.append(Link(
+                text=link_text,
+                url=full_url,
+                is_external=is_external
+            ))
+            
+        # Remove duplicates (same URL and text)
+        unique_links = []
+        seen_urls = set()
+        
+        for link in links:
+            key = (link.url, link.text)
+            if key not in seen_urls:
+                seen_urls.add(key)
+                unique_links.append(link)
+                
+        return unique_links
+        
+    def _extract_main_content(self, soup: BeautifulSoup) -> List[ScrapedContent]:
+        """Extract main content in a structured way."""
+        content_items = []
+        
+        # Process headings
+        for level in range(1, 7):
+            for heading in soup.find_all(f'h{level}'):
+                if self._is_visible_element(heading):
+                    text = heading.get_text(strip=True)
+                    if text:
+                        content_items.append(ScrapedContent(
+                            type='heading',
+                            text=text,
+                            level=level
+                        ))
+        
+        # Process paragraphs
+        for p in soup.find_all('p'):
+            if self._is_visible_element(p):
+                text = p.get_text(strip=True)
+                if text:
+                    content_items.append(ScrapedContent(
+                        type='paragraph',
+                        text=text
+                    ))
+        
+        # Process lists
+        for list_tag in soup.find_all(['ul', 'ol']):
+            if self._is_visible_element(list_tag):
+                list_type = 'unordered_list' if list_tag.name == 'ul' else 'ordered_list'
+                
+                # Get list items
+                list_items = []
+                for li in list_tag.find_all('li', recursive=False):
+                    item_text = li.get_text(strip=True)
+                    if item_text:
+                        list_items.append(item_text)
+                
+                if list_items:
+                    content_items.append(ScrapedContent(
+                        type=list_type,
+                        text='\n'.join(f"• {item}" for item in list_items)
+                    ))
+        
+        # Look for content in divs only if we don't have enough content yet
+        # This helps avoid getting too much boilerplate
+        if len(content_items) < 5:
+            for div in soup.find_all('div'):
+                if self._is_visible_element(div) and not div.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol']):
+                    text = div.get_text(strip=True)
+                    if text and len(text) > 40:  # Only get substantial text
+                        content_items.append(ScrapedContent(
+                            type='content_block',
+                            text=text
+                        ))
+        
+        # Remove duplicates and noise
+        return self._remove_duplicate_content(content_items)
 
     async def _scrape_single_url(self, url: str, include_markdown: bool = False) -> ScrapeResult:
-        """Scrape a single URL and return structured data."""
+        """Scrape a single URL and return structured data focused on visible content."""
         timestamp = datetime.utcnow().isoformat()
         
         try:
             async with httpx.AsyncClient(follow_redirects=True) as client:
-                response = await client.get(url)
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                response = await client.get(url, headers=headers)
                 response.raise_for_status()
                 html_content = response.text
 
             soup = BeautifulSoup(html_content, 'html.parser')
+            
+            # Remove invisible elements
+            for invisible in soup.find_all(['script', 'style', 'meta', 'noscript']):
+                invisible.extract()
+            
+            for comment in soup.find_all(text=lambda text: isinstance(text, Comment)):
+                comment.extract()
+                
+            # Basic page information
             title = soup.title.string if soup.title else None
             meta_tags = await self._extract_meta_tags(soup)
             json_ld = await self._extract_json_ld(html_content)
-            text = soup.get_text(separator='\n', strip=True)
-
-            # Generate markdown if requested
-            markdown = await self._html_to_markdown(html_content) if include_markdown else None
+            
+            # Get meta description
+            meta_description = None
+            for tag in meta_tags:
+                if (tag.name == 'description' or tag.property == 'og:description') and tag.content:
+                    meta_description = tag.content
+                    break
+            
+            # Extract main content and links
+            main_content = self._extract_main_content(soup)
+            links = self._extract_links(soup, url)
 
             return ScrapeResult(
                 url=url,
                 timestamp=timestamp,
                 title=title,
-                html=html_content,
-                text=text,
-                markdown=markdown,
-                meta_tags=meta_tags,
+                main_content=main_content,
+                links=links,
+                meta_description=meta_description,
+                meta_tags=meta_tags, 
                 json_ld=json_ld
             )
         except Exception as e:
             return ScrapeResult(
                 url=url,
                 timestamp=timestamp,
-                html="",
+                main_content=[],
+                links=[],
                 meta_tags=[],
                 json_ld=[],
                 error=str(e)
